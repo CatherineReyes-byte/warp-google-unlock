@@ -36,5 +36,6 @@
 支持系统：Ubuntu / Debian / CentOS / AlmaLinux
 要求：Root 权限
 
-```bash
+```bash warp-zero-trust.sh
 bash <(curl -sL https://raw.githubusercontent.com/CatherineReyes-byte/warp-google-unlock/main/warp-setup.sh)
+bash <(curl -sL https://raw.githubusercontent.com/CatherineReyes-byte/warp-google-unlock/main/warp-zero-trust.sh)
