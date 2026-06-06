@@ -244,12 +244,13 @@ start() {
     
     # 添加 Google IP 规则
     for ip in $GOOGLE_IPS; do
+        [ -z "$ip" ]      && continue   # 跳过空行（原有）
+        [[ "$ip" == \#* ]] && continue   # 跳过 # 注释行（新增）
         iptables -t nat -A WARP_GOOGLE -d $ip -p tcp -j REDIRECT --to-ports 12345
     done
     
     # 应用到 OUTPUT 链
     iptables -t nat -C OUTPUT -j WARP_GOOGLE 2>/dev/null || iptables -t nat -A OUTPUT -j WARP_GOOGLE
-    
     echo "Google 透明代理已启动"
 }
 
