@@ -433,6 +433,13 @@ do_uninstall() {
     rm -f /usr/local/bin/warp
     rm -f /etc/redsocks.conf
     
+    # 清理 Zero Trust 配置
+    systemctl disable warp-zt-restore 2>/dev/null
+    systemctl stop warp-zt-restore 2>/dev/null
+    rm -f /etc/systemd/system/warp-zt-restore.service
+    rm -f /usr/local/bin/warp-zt-restore
+    rm -f "$ZT_CONFIG"
+    
     # 清理 iptables 规则
     iptables -t nat -D OUTPUT -j WARP_GOOGLE 2>/dev/null
     iptables -t nat -F WARP_GOOGLE 2>/dev/null
@@ -537,20 +544,181 @@ do_stop() {
     echo -e "${GREEN}✓ WARP 已停止${NC}\n"
 }
 
+# Zero Trust 配置持久化文件
+ZT_CONFIG="/etc/warp-zero-trust.conf"
+
+# 切换到 Zero Trust 模式
+do_setup_zero_trust() {
+    echo -e "\n${CYAN}══════════════ 配置 Zero Trust 模式 ══════════════${NC}\n"
+    
+    # 检查 warp-cli 是否已安装
+    if ! command -v warp-cli &>/dev/null; then
+        echo -e "${RED}错误：WARP 未安装，请先选择选项 1 安装${NC}\n"
+        return 1
+    fi
+    
+    # 输入 Zero Trust 组织名称
+    local org_name=""
+    while [ -z "$org_name" ]; do
+        read -p "请输入 Zero Trust 组织名称 (Team Name): " org_name
+    done
+    
+    echo -e "\n${CYAN}正在注册到 Zero Trust 组织: ${org_name}${NC}"
+    
+    # 断开当前连接
+    warp-cli disconnect 2>/dev/null
+    sleep 1
+    
+    # 切换到 Zero Trust 模式并注册组织
+    if warp-cli --accept-tos teams-enroll "$org_name" 2>/dev/null || \
+       warp-cli --accept-tos registration new --team "$org_name" 2>/dev/null; then
+        echo -e "${GREEN}✓ 已发送注册请求${NC}"
+    else
+        echo -e "${YELLOW}提示：正在等待验证码...${NC}"
+    fi
+    
+    echo -e "\n${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}请检查你的邮箱，获取 Zero Trust 验证码${NC}"
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+    
+    # 输入验证码
+    local token=""
+    while [ -z "$token" ]; do
+        read -p "请输入验证码 (Token): " token
+    done
+    
+    echo -e "\n${CYAN}正在验证...${NC}"
+    
+    # 提交验证码
+    if warp-cli --accept-tos registration token "$token" 2>/dev/null || \
+       warp-cli --accept-tos teams-enroll-token "$token" 2>/dev/null; then
+        echo -e "${GREEN}✓ 验证成功${NC}"
+    else
+        echo -e "${RED}✗ 验证失败，请检查验证码是否正确${NC}\n"
+        return 1
+    fi
+    
+    # 设置代理模式（保持与原脚本一致）
+    warp-cli --accept-tos mode proxy 2>/dev/null || warp-cli mode proxy 2>/dev/null
+    warp-cli --accept-tos proxy port 40000 2>/dev/null || warp-cli proxy port 40000 2>/dev/null
+    
+    # 连接
+    echo -e "${CYAN}正在连接 Zero Trust...${NC}"
+    warp-cli --accept-tos connect 2>/dev/null || warp-cli connect 2>/dev/null
+    sleep 3
+    
+    # 保存配置，用于开机自动恢复
+    save_zero_trust_config "$org_name"
+    
+    # 更新 systemd 服务支持 Zero Trust 自动恢复
+    setup_zero_trust_service
+    
+    # 验证连接
+    local status
+    status=$(warp-cli --accept-tos status 2>/dev/null || warp-cli status 2>/dev/null)
+    echo -e "\n${CYAN}当前状态: ${GREEN}$status${NC}"
+    
+    # 测试连通性
+    echo -e "\n${CYAN}测试连接...${NC}"
+    local test_result
+    test_result=$(curl -x socks5://127.0.0.1:40000 \
+        -s --max-time 10 -o /dev/null \
+        -w "%{http_code}" https://www.google.com 2>/dev/null)
+    
+    if [ "$test_result" = "200" ]; then
+        echo -e "${GREEN}✓ Zero Trust 连接成功！${NC}"
+    else
+        echo -e "${YELLOW}连接测试返回: $test_result（可能需要等待几秒）${NC}"
+    fi
+    
+    echo -e "\n${GREEN}╔════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║        ✅ Zero Trust 模式配置完成！                 ║${NC}"
+    echo -e "${GREEN}║        重启后将自动恢复 Zero Trust 连接             ║${NC}"
+    echo -e "${GREEN}╚════════════════════════════════════════════════════╝${NC}\n"
+}
+
+# 保存 Zero Trust 配置
+save_zero_trust_config() {
+    cat > "$ZT_CONFIG" << EOF
+# WARP Zero Trust 配置
+# 由 warp 脚本自动生成
+ZT_ORG="$1"
+ZT_MODE="proxy"
+ZT_PORT="40000"
+ZT_ENABLED="1"
+EOF
+    chmod 600 "$ZT_CONFIG"
+    echo -e "${GREEN}✓ Zero Trust 配置已保存到 $ZT_CONFIG${NC}"
+}
+
+# 配置开机自动恢复 Zero Trust
+setup_zero_trust_service() {
+    # 创建自动恢复脚本
+    cat > /usr/local/bin/warp-zt-restore << 'ZTSCRIPT'
+#!/bin/bash
+
+ZT_CONFIG="/etc/warp-zero-trust.conf"
+
+# 加载配置
+[ -f "$ZT_CONFIG" ] && source "$ZT_CONFIG"
+
+# 如果不是 ZT 模式则退出
+[ "$ZT_ENABLED" != "1" ] && exit 0
+
+echo "$(date): 恢复 Zero Trust 连接模式..."
+
+# 等待网络就绪
+sleep 5
+
+# 确保模式正确
+warp-cli mode proxy 2>/dev/null
+warp-cli proxy port "${ZT_PORT:-40000}" 2>/dev/null
+
+# 连接
+warp-cli connect 2>/dev/null
+
+echo "$(date): Zero Trust 模式已恢复"
+ZTSCRIPT
+
+    chmod +x /usr/local/bin/warp-zt-restore
+    
+    # 创建开机恢复服务
+    cat > /etc/systemd/system/warp-zt-restore.service << 'EOF'
+[Unit]
+Description=WARP Zero Trust Auto Restore
+After=network-online.target warp-svc.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/warp-zt-restore
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable warp-zt-restore 2>/dev/null
+    echo -e "${GREEN}✓ 开机自动恢复服务已启用${NC}"
+}
+
 # 显示菜单
 show_menu() {
     echo -e "${YELLOW}请选择操作:${NC}\n"
     echo -e "  ${GREEN}1.${NC} 安装 WARP (解锁 Gemini和商店等)"
     echo -e "  ${GREEN}2.${NC} 卸载 WARP"
     echo -e "  ${GREEN}3.${NC} 查看状态"
+    echo -e "  ${GREEN}4.${NC} 切换到 Zero Trust 模式"
     echo -e "  ${GREEN}0.${NC} 退出\n"
     
-    read -p "请输入选项 [0-3]: " choice
+    read -p "请输入选项 [0-4]: " choice
     
     case $choice in
         1) do_install ;;
         2) do_uninstall ;;
         3) do_status; do_show_ip; do_test_google ;;
+        4) do_setup_zero_trust ;;
         0) echo -e "\n${GREEN}再见！${NC}\n"; exit 0 ;;
         *) echo -e "\n${RED}无效选项${NC}\n" ;;
     esac
