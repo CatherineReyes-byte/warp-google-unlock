@@ -93,7 +93,7 @@ setup_zero_trust() {
     echo -e "2. 输入邮箱并完成验证码验证。"
     echo -e "3. 页面显示 ${GREEN}Success${NC} 后，${RED}不要${NC}直接点击\"打开 Cloudflare WARP\"。"
     echo -e "4. 右键点击该按钮 → 选择\"复制链接地址\" (或从浏览器 F12 网络请求中提取)。"
-    echo -e "   链接格式必须为：${CYAN}com.cloudflare.warp://.../auth?token=eyJ...${NC}"
+    echo -e "   链接格式必须为：${CYAN}com.cloudflare.warp://.../auth?token=eyJ...不要复制引号后内容${NC}"
     echo -e "${YELLOW}===========================================${NC}"
 
     # ── 输入 token URI ───────────────────────────────────────────
