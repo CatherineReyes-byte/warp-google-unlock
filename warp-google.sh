@@ -175,8 +175,13 @@ EOF
 #!/bin/bash
 
 # Google IP 段
+#google.com 21
+#hub 6
+#mata 17
+#reddit.com 2
+#xdaforums.com2
+#hostloc.com1
 GOOGLE_IPS="
-google.com
 8.8.4.0/24
 8.8.8.0/24
 34.0.0.0/9
@@ -198,17 +203,14 @@ google.com
 209.85.128.0/17
 216.58.192.0/19
 216.239.32.0/19
-pornhub.com
+
 31.192.112.0/22
 31.192.116.0/22
 66.254.110.0/24
 104.18.0.0/15
 185.83.208.0/22
 66.254.114.0/24
-Facebook.com
-Instagram.com
-WhatsApp.com
-Threads.com
+
 31.13.24.0/21
 31.13.64.0/18
 45.64.40.0/22
@@ -226,14 +228,13 @@ Threads.com
 179.60.192.0/22
 185.89.216.0/22
 204.15.20.0/22
-reddit.com
+
 151.101.0.0/16
 54.172.97.0/22
-xdaforums.com
-xda-developers.com
+
 52.5.0.0/16
 37.19.0.0/16
-hostloc.com
+
 23.255.155.0/24
 "
 
