@@ -656,6 +656,7 @@ xdaforums.com
 xda-developers.com
 hostloc.com
 www.hostloc.com
+gamer.com.tw
 www.gamer.com.tw
 54.172.97.0/22
 23.255.155.0/24
