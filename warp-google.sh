@@ -656,6 +656,7 @@ xdaforums.com
 xda-developers.com
 hostloc.com
 www.hostloc.com
+www.gamer.com.tw
 54.172.97.0/22
 23.255.155.0/24
 # 以下两段体积很大(AWS us-east-1 / Datacamp CDN)，v1 曾默认启用，容易误伤，默认关闭:
