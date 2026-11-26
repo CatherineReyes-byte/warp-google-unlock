@@ -1,20 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  WARP 一键脚本 v2.1 —— Cloudflare 官方客户端 + 精准动态分流
+#  WARP 一键脚本 v2.2 —— Cloudflare 官方客户端 + 精准动态分流
 #
-#  架构说明:
-#    1. 非 Google 系分流 (extra.list):
-#       iptables nat/OUTPUT(WARP_GOOGLE) -> redsocks(12345) -> warp-cli SOCKS5(40000)
-#       全局 WARP 服务与原有非 Google 系业务始终保持正常运行。
-#    2. Gemini 三域名精准动态分流:
-#       仅限 gemini.google.com / aistudio.google.com / generativelanguage.googleapis.com
-#       - 默认 DIRECT: 不挂载 WARP_GEMINI 规则，全部走 VPS 原有直连出口。
-#       - 明确地区受限 -> WARP: 仅将三域名当前 IP 重定向至本地 warp-sni-proxy(12350)，
-#         由 SNI/Host 精确匹配器仅将这三个完整域名送入 WARP(40000)，
-#         共享同 IP 的 accounts.google.com / www.google.com / 其他 Google 子域名
-#         均打上 SO_MARK(0x5752) 直接回源直连，绝不进入 WARP。
-#       - 30~60 分钟独立随机检测 + 两次独立直连正常后自动回归 DIRECT +
-#         WARP 受限自动轮换 Endpoint（含备份、IP校验、Gemini 校验与失败回滚）。
+#  修复 (相对 v2.1):
+#    1. 恢复 WARP_GOOGLE 使用 -I OUTPUT 1 插入链头，避免被 VPS 已有规则截胡
+#    2. 移除 188.114.96.0/20 与 162.159.0.0/16 宽泛排除，改用精确 $eps 防回环，
+#       解决 extra.list 中 Cloudflare 托管站点误走直连的问题
+#    3. 新增 WARP_GOOGLE_X6：双栈 VPS 上强制 extra.list 域名回落 IPv4 走 WARP
+#    4. extra.list 域名多轮解析缓存 + 300s 快速刷新 + 安装后强制校验规则生效
 # =============================================================================
 
 trap '' HUP
@@ -41,8 +34,8 @@ show_banner() {
     [ -t 1 ] && clear
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════╗"
-    echo "║   WARP 一键脚本 v2.1 - Gemini 直连优先 & 精准动态分流  ║"
-    echo "║   保留全局 WARP · 精确 SNI 匹配 · 随机检测 · 自动恢复  ║"
+    echo "║   WARP 一键脚本 v2.2 - Gemini 直连优先 & 精准动态分流  ║"
+    echo "║   修复 extra.list 分流 · 精确 SNI · 随机检测 · 自动恢复║"
     echo "╚══════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -82,9 +75,6 @@ pkg_install() {
     esac
 }
 
-# ----------------------------------------------------------------------------
-# 备份原始脚本、配置与防火墙快照
-# ----------------------------------------------------------------------------
 backup_existing() {
     local has_old=0 ts bdir
     [ -e "$ENGINE" ] && has_old=1
@@ -103,20 +93,14 @@ backup_existing() {
     command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save > "$bdir/iptables.v6.rules" 2>/dev/null || true
     {
         echo "# Backup created at $(date -Iseconds)"
-        echo "# Original WARP_GOOGLE nat rules:"
         iptables -w -t nat -S WARP_GOOGLE 2>/dev/null || true
-        echo "# Original WARP_GOOGLE_F filter rules:"
         iptables -w -t filter -S WARP_GOOGLE_F 2>/dev/null || true
-        echo "# Original WARP_GOOGLE6 filter rules:"
         ip6tables -w -t filter -S WARP_GOOGLE6 2>/dev/null || true
     } > "$bdir/rules-manifest.txt"
     ln -sfn "$bdir" "$BACKUP_BASE/latest"
     ok "已自动备份原有脚本与配置至: $bdir"
 }
 
-# ----------------------------------------------------------------------------
-# 写入 Python3 SNI 精准分发器与 Gemini 状态机管理器
-# ----------------------------------------------------------------------------
 write_python_modules() {
     mkdir -p "$LIB_DIR" "$LOG_DIR"
 
@@ -134,7 +118,6 @@ import os
 import signal
 import socket
 import struct
-import sys
 import time
 
 SO_ORIGINAL_DST = 80
@@ -151,11 +134,7 @@ STATS_FILE = "/run/warp-google/sni-stats.json"
 
 
 def load_conf():
-    cfg = {
-        "PROXY_PORT": 40000,
-        "SNI_PORT": 12350,
-        "DIRECT_MARK": 0x5752,
-    }
+    cfg = {"PROXY_PORT": 40000, "SNI_PORT": 12350, "DIRECT_MARK": 0x5752}
     if os.path.exists(CONF_FILE):
         with open(CONF_FILE, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
@@ -200,7 +179,6 @@ def flush_stats():
 
 
 def parse_tls_sni(data: bytes):
-    """Return lowercase SNI hostname if TLS ClientHello with SNI, else None."""
     if len(data) < 5 or data[0] != 0x16:
         return None
     record_len = int.from_bytes(data[3:5], "big")
@@ -208,14 +186,14 @@ def parse_tls_sni(data: bytes):
         return "NEED_MORE"
     pos = 5
     end = 5 + record_len
-    if pos + 4 > end or data[pos] != 0x01:  # HandshakeType::client_hello
+    if pos + 4 > end or data[pos] != 0x01:
         return None
     hs_len = int.from_bytes(data[pos + 1:pos + 4], "big")
     pos += 4
     hs_end = min(end, pos + hs_len)
     if pos + 34 > hs_end:
         return None
-    pos += 2 + 32  # client_version + random
+    pos += 2 + 32
     if pos + 1 > hs_end:
         return None
     sid_len = data[pos]
@@ -239,7 +217,7 @@ def parse_tls_sni(data: bytes):
         pos += 4
         if pos + ext_len > ext_end:
             break
-        if ext_type == 0x0000 and ext_len >= 2:  # server_name
+        if ext_type == 0x0000 and ext_len >= 2:
             list_len = int.from_bytes(data[pos:pos + 2], "big")
             p = pos + 2
             lend = min(pos + ext_len, p + list_len)
@@ -313,7 +291,6 @@ async def open_socks5(host: str, port: int):
         resp = await asyncio.wait_for(reader.readexactly(2), timeout=5.0)
         if resp != b"\x05\x00":
             raise ConnectionError(f"SOCKS5 auth rejected: {resp!r}")
-
         hb = host.encode("ascii")
         req = b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb + struct.pack("!H", port)
         writer.write(req)
@@ -323,12 +300,12 @@ async def open_socks5(host: str, port: int):
             raise ConnectionError(f"SOCKS5 connect failed code={hdr[1]}")
         atyp = hdr[3]
         if atyp == 1:
-            await reader.readexactly(4 + 2)
+            await reader.readexactly(6)
         elif atyp == 3:
             alen = (await reader.readexactly(1))[0]
             await reader.readexactly(alen + 2)
         elif atyp == 4:
-            await reader.readexactly(16 + 2)
+            await reader.readexactly(18)
         return reader, writer
     except Exception:
         writer.close()
@@ -419,7 +396,6 @@ async def main():
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop_event.set)
-
     server = await asyncio.start_server(handle_client, "127.0.0.1", CFG["SNI_PORT"], reuse_address=True)
     flush_stats()
     async with server:
@@ -680,7 +656,6 @@ class CustomHTTPSConnection(http.client.HTTPSConnection):
                     s.close()
             if sock is None:
                 raise last_err or ConnectionError("TCP connect failed")
-
         self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
 
 
@@ -736,13 +711,7 @@ def http_fetch(url: str, mark: int = 0, socks_port: int = 0, max_redirects: int 
             "dns_ips": dns_ips,
             "body": body,
         }
-    return {
-        "status": 310,
-        "final_url": cur,
-        "redirects": redirects,
-        "dns_ips": dns_ips,
-        "body": "",
-    }
+    return {"status": 310, "final_url": cur, "redirects": redirects, "dns_ips": dns_ips, "body": ""}
 
 
 def get_egress_ip(mark: int = 0, socks_port: int = 0):
@@ -839,18 +808,14 @@ def probe_single_domain(domain: str, mark: int = 0, socks_port: int = 0, retries
             if res["dns_ips"]:
                 last_ips = res["dns_ips"]
             cat, detail = classify_domain_response(domain, res)
-            if cat in ("SERVER_ERROR",) and attempts <= retries:
+            if cat == "SERVER_ERROR" and attempts <= retries:
                 last_cat, last_detail = cat, detail
                 time.sleep(5)
                 continue
             return {
-                "domain": domain,
-                "category": cat,
-                "detail": detail,
-                "status": res["status"],
-                "final_url": res["final_url"],
-                "dns_ips": last_ips,
-                "attempts": attempts,
+                "domain": domain, "category": cat, "detail": detail,
+                "status": res["status"], "final_url": res["final_url"],
+                "dns_ips": last_ips, "attempts": attempts,
             }
         except Exception as exc:
             last_cat = classify_error(exc)
@@ -858,13 +823,8 @@ def probe_single_domain(domain: str, mark: int = 0, socks_port: int = 0, retries
             if attempts <= retries:
                 time.sleep(5)
     return {
-        "domain": domain,
-        "category": last_cat,
-        "detail": last_detail,
-        "status": 0,
-        "final_url": "",
-        "dns_ips": last_ips,
-        "attempts": attempts,
+        "domain": domain, "category": last_cat, "detail": last_detail,
+        "status": 0, "final_url": "", "dns_ips": last_ips, "attempts": attempts,
     }
 
 
@@ -874,17 +834,13 @@ def probe_path(mode_label: str, mark: int = 0, socks_port: int = 0):
     for d in TARGET_DOMAINS:
         results[d] = probe_single_domain(d, mark=mark, socks_port=socks_port, retries=2)
     core = results["gemini.google.com"]
-    verdict = core["category"]
     aux_geo = [
         d for d in ("aistudio.google.com", "generativelanguage.googleapis.com")
         if results[d]["category"] == "GEO_BLOCKED"
     ]
     return {
-        "path": mode_label,
-        "egress_ip": egress_ip,
-        "verdict": verdict,
-        "aux_geo_blocked": aux_geo,
-        "domains": results,
+        "path": mode_label, "egress_ip": egress_ip,
+        "verdict": core["category"], "aux_geo_blocked": aux_geo, "domains": results,
     }
 
 
@@ -1017,7 +973,6 @@ def disable_gemini_warp():
 
 
 def verify_unmarked_connectivity():
-    """Verify actual un-marked requests on the host succeed."""
     res = {}
     for d in TARGET_DOMAINS:
         res[d] = probe_single_domain(d, mark=0, socks_port=0, retries=1)
@@ -1055,7 +1010,7 @@ def restore_boot_state():
         else:
             disable_gemini_warp()
             st["mode"] = "DIRECT"
-            LOG.info("启动默认/恢复状态: DIRECT (三域名全部直连，全局 WARP 与其他分流规则不受影响)")
+            LOG.info("启动默认/恢复状态: DIRECT (三域名全部直连，全局 WARP 与 extra.list 规则不受影响)")
         save_state(st, backup_first=False)
 
 
@@ -1088,8 +1043,7 @@ def run_check_round():
                 verdict = d_probe["verdict"]
                 LOG.info(
                     "DIRECT 检测结果: IP=%s | 判定=%s | 详情=%s | aux_geo=%s",
-                    d_probe["egress_ip"] or "?",
-                    verdict,
+                    d_probe["egress_ip"] or "?", verdict,
                     {k: v["category"] for k, v in d_probe["domains"].items()},
                     d_probe["aux_geo_blocked"],
                 )
@@ -1119,10 +1073,8 @@ def run_check_round():
                             e2e, non_warp = verify_unmarked_connectivity()
                             LOG.info(
                                 "已切换至 WARP | WARP_IP=%s | WARP_Gemini=%s | 端到端三域名=%s | 非WARP抽检=%s",
-                                w_probe["egress_ip"] or "?",
-                                w_probe["verdict"],
-                                {k: v["category"] for k, v in e2e.items()},
-                                non_warp,
+                                w_probe["egress_ip"] or "?", w_probe["verdict"],
+                                {k: v["category"] for k, v in e2e.items()}, non_warp,
                             )
                             if w_probe["verdict"] == "GEO_BLOCKED":
                                 LOG.warning("当前 WARP 出口也受地区限制，启动 Endpoint 自动轮换...")
@@ -1137,7 +1089,7 @@ def run_check_round():
                     st["last_error"] = f"direct_probe:{verdict}"
                     LOG.info("非地区限制状态(%s)，不触发 WARP 切换，保持 DIRECT", verdict)
 
-            else:  # cur_mode == "WARP"
+            else:
                 if check_warp_trace():
                     ok, err = enable_gemini_warp()
                     if not ok:
@@ -1154,8 +1106,7 @@ def run_check_round():
                 st["last_warp_result"] = w_probe
                 LOG.info(
                     "WARP 出口检测: IP=%s | 判定=%s | 详情=%s",
-                    w_probe["egress_ip"] or "?",
-                    w_probe["verdict"],
+                    w_probe["egress_ip"] or "?", w_probe["verdict"],
                     {k: v["category"] for k, v in w_probe["domains"].items()},
                 )
                 if w_probe["verdict"] == "GEO_BLOCKED":
@@ -1164,15 +1115,13 @@ def run_check_round():
                     rotate_endpoint(st)
                     st["mode"] = "WARP"
 
-                # Independent DIRECT probe via SO_MARK without touching global WARP
                 d_probe = probe_path("DIRECT_BYPASS", mark=CFG["DIRECT_MARK"])
                 st["last_direct_ip"] = d_probe["egress_ip"]
                 st["last_direct_result"] = d_probe
                 d_verdict = d_probe["verdict"]
                 LOG.info(
                     "独立直连旁路检测(SO_MARK): IP=%s | 判定=%s | 详情=%s",
-                    d_probe["egress_ip"] or "?",
-                    d_verdict,
+                    d_probe["egress_ip"] or "?", d_verdict,
                     {k: v["category"] for k, v in d_probe["domains"].items()},
                 )
 
@@ -1193,8 +1142,7 @@ def run_check_round():
                         st["last_error"] = ""
                         LOG.info(
                             "直连连续两次独立确认恢复，已关闭三域名 WARP 分流回归 DIRECT (全局 WARP 与 extra.list 保持运行) | 验证=%s | 非WARP=%s",
-                            {k: v["category"] for k, v in e2e.items()},
-                            non_warp,
+                            {k: v["category"] for k, v in e2e.items()}, non_warp,
                         )
                 else:
                     if st.get("direct_recover_streak", 0) != 0:
@@ -1261,16 +1209,14 @@ MGR_EOF
     chmod 755 "$LIB_DIR/gemini_mgr.py"
 }
 
-# ----------------------------------------------------------------------------
-# 引擎脚本 (/usr/local/bin/warp-google，同时软链为 `warp`)
-# ----------------------------------------------------------------------------
 write_engine() {
     mkdir -p "$CONF_DIR" "$LIB_DIR" "$LOG_DIR"
     write_python_modules
     cat > "$ENGINE" << 'ENGINE_EOF'
 #!/usr/bin/env bash
-# WARP-GOOGLE-ENGINE v2.1
-# 保留全局 WARP 与 extra.list 分流；Gemini 三域名由 gemini_mgr.py + sni_proxy.py 精准动态管理。
+# WARP-GOOGLE-ENGINE v2.2
+# extra.list 非 Google 分流走 WARP_GOOGLE + redsocks(12345) + WARP_GOOGLE_X6(IPv6回落)
+# Gemini 三域名由 gemini_mgr.py + sni_proxy.py 精准动态管理
 
 CONF_DIR=/etc/warp-google
 LIB_DIR=/usr/local/lib/warp-google
@@ -1286,21 +1232,24 @@ BLOCK_IPV6=${BLOCK_IPV6:-1}
 
 CHAIN=WARP_GOOGLE         # nat/OUTPUT : extra.list TCP 重定向到 redsocks
 CHAIN_F=WARP_GOOGLE_F     # filter/OUTPUT : extra.list 拒绝 UDP 443
-CHAIN_6=WARP_GOOGLE6      # 遗留 Google IPv6 屏蔽链(v2.1 清理)
+CHAIN_X6=WARP_GOOGLE_X6   # ip6tables filter/OUTPUT : 仅对 extra.list 域名阻断 IPv6，强制回落 IPv4
+CHAIN_6=WARP_GOOGLE6      # v2.0 遗留 Google IPv6 屏蔽链(v2.2 清理)
 CHAIN_G=WARP_GEMINI       # nat/OUTPUT : Gemini 三域名 IP 重定向到 SNI 分发器
-CHAIN_GF=WARP_GEMINI_F    # filter/OUTPUT : Gemini 三域名 IP 拒绝 UDP 443(仅 WARP 模式挂载)
+CHAIN_GF=WARP_GEMINI_F    # filter/OUTPUT : Gemini 三域名 IP 拒绝 UDP 443
 CHAIN_G6=WARP_GEMINI6     # ip6tables filter/OUTPUT : 仅三域名 AAAA(仅 WARP 模式挂载)
 
 STATE_DIR=/run/warp-google
 GEMINI_HOSTS="gemini.google.com aistudio.google.com generativelanguage.googleapis.com"
-EXCLUDES="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4 162.159.0.0/16 188.114.96.0/20"
+# 仅排除保留/内网段；WARP 自身端点由 warp_endpoints 动态精确排除，避免误放行 extra.list 中的 Cloudflare CDN 站点
+EXCLUDES="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4"
+EXCLUDES_GEMINI="$EXCLUDES 162.159.0.0/16 188.114.96.0/20"
 WARP_DOMAINS="api.cloudflareclient.com engage.cloudflareclient.com connectivity.cloudflareclient.com zero-trust-client.cloudflareclient.com"
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'; CYAN=$'\033[0;36m'; NC=$'\033[0m'
 say()  { echo -e "$*"; }
 log()  { echo "$*"; logger -t warp-google "$*" 2>/dev/null; return 0; }
 
-wcli() { warp-cli --accept-tos "$@"; }
+wcli() { timeout 15 warp-cli --accept-tos "$@"; }
 is_connected() { wcli status 2>/dev/null | grep -Eq 'Status update:[[:space:]]*Connected'; }
 
 wait_daemon() {
@@ -1368,19 +1317,50 @@ cmd_setup_warp() {
     return 0
 }
 
-# ---------------------------------------------------------------- 规则收集: 仅 extra.list 走 WARP_GOOGLE
+# ---------------------------------------------------------------- 规则收集: extra.list 走 WARP_GOOGLE
+extra_list_sig() {
+    stat -c '%Y:%s' "$CONF_DIR/extra.list" 2>/dev/null || echo "none"
+}
+
 collect_targets() {
+    local f="$CONF_DIR/extra.list" line sig prev_sig cache="$STATE_DIR/extra-ips.cache" sigf="$STATE_DIR/extra-ips.sig"
+    [ -f "$f" ] || return 0
+    mkdir -p "$STATE_DIR"
+    sig=$(extra_list_sig)
+    prev_sig=$(cat "$sigf" 2>/dev/null || echo "")
+    if [ "$sig" != "$prev_sig" ]; then
+        rm -f "$cache"
+        echo "$sig" > "$sigf"
+    fi
+
+    {
+        [ -f "$cache" ] && cat "$cache"
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%%#*}"; line="${line//[[:space:]]/}"
+            [ -z "$line" ] && continue
+            if [[ "$line" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
+                echo "$line"
+            elif [[ "$line" =~ ^[A-Za-z0-9._-]+$ ]]; then
+                getent ahostsv4 "$line" 2>/dev/null | awk '{print $1}'
+                getent ahostsv4 "$line" 2>/dev/null | awk '{print $1}'
+                command -v dig >/dev/null 2>&1 && dig +short +time=2 +tries=1 A "$line" 2>/dev/null
+            fi
+        done < "$f"
+    } | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$' | sort -u | tee "$cache"
+}
+
+collect_extra_v6() {
     local f="$CONF_DIR/extra.list" line
     [ -f "$f" ] || return 0
     while IFS= read -r line || [ -n "$line" ]; do
         line="${line%%#*}"; line="${line//[[:space:]]/}"
         [ -z "$line" ] && continue
-        if [[ "$line" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
+        if [[ "$line" =~ ^[0-9a-fA-F:]+(/[0-9]+)?$ ]] && [[ "$line" == *:* ]]; then
             echo "$line"
         elif [[ "$line" =~ ^[A-Za-z0-9._-]+$ ]]; then
-            getent ahostsv4 "$line" 2>/dev/null | awk '{print $1}'
+            getent ahostsv6 "$line" 2>/dev/null | awk '{print $1}'
         fi
-    done | sort -u
+    done | grep -E '^[0-9a-fA-F:]+(/[0-9]+)?$' | sort -u
 }
 
 collect_gemini_v4() {
@@ -1406,7 +1386,7 @@ collect_gemini_v6() {
 warp_endpoints() {
     local d ep
     for d in $WARP_DOMAINS; do getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}'; done
-    ep=$(warp-cli --accept-tos settings 2>/dev/null | awk -F: '/[Ee]ndpoint/ {gsub(/[[:space:]]/,"",$2); print $2}' | cut -d: -f1)
+    ep=$(timeout 5 warp-cli --accept-tos settings 2>/dev/null | awk -F: '/[Ee]ndpoint/ {gsub(/[[:space:]]/,"",$2); print $2}' | head -n1)
     [[ "$ep" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo "$ep"
 }
 
@@ -1426,16 +1406,16 @@ drop_chain() {
     return 0
 }
 
-# 挂载/刷新 extra.list 非 Google 分流规则
+# 挂载/刷新 extra.list 非 Google 分流规则（恢复 -I OUTPUT 1 优先挂载 + IPv6 回落 IPv4）
 rules_on() {
     command -v iptables-restore >/dev/null 2>&1 || { say "${RED}缺少 iptables-restore${NC}"; return 1; }
-    local f4 ff targets eps n t
+    local f4 ff fx6 targets targets6 eps n t t6
     targets=$(collect_targets)
     if [ -z "$targets" ]; then
         rules_off_extra
         return 0
     fi
-    f4=$(mktemp); ff=$(mktemp)
+    f4=$(mktemp); ff=$(mktemp); fx6=$(mktemp)
     eps=$(warp_endpoints | sort -u)
 
     { echo "*nat"; echo ":$CHAIN - [0:0]"
@@ -1451,27 +1431,49 @@ rules_on() {
       echo "COMMIT"; } > "$ff"
 
     if ! restore iptables-restore "$f4"; then
-        rm -f "$f4" "$ff"
+        rm -f "$f4" "$ff" "$fx6"
         say "${RED}写入 WARP_GOOGLE nat 规则失败${NC}"; return 1
     fi
     restore iptables-restore "$ff" || say "${YELLOW}! extra.list QUIC 拦截规则写入失败${NC}"
-    iptables -w -t nat -C OUTPUT -p tcp -j "$CHAIN" 2>/dev/null || iptables -w -t nat -A OUTPUT -p tcp -j "$CHAIN"
-    iptables -w -C OUTPUT -p udp --dport 443 -j "$CHAIN_F" 2>/dev/null || iptables -w -A OUTPUT -p udp --dport 443 -j "$CHAIN_F" 2>/dev/null
-    rm -f "$f4" "$ff"
+
+    # 关键修复: 使用 -I OUTPUT 1 保证位于其他默认/放行规则之前
+    iptables -w -t nat -C OUTPUT -p tcp -j "$CHAIN" 2>/dev/null || iptables -w -t nat -I OUTPUT 1 -p tcp -j "$CHAIN"
+    iptables -w -C OUTPUT -p udp --dport 443 -j "$CHAIN_F" 2>/dev/null || iptables -w -I OUTPUT 1 -p udp --dport 443 -j "$CHAIN_F" 2>/dev/null
+
+    # 关键修复: 仅对 extra.list 域名解析出的 IPv6 拒绝直连，强制双栈机器上的 extra.list 回落到 IPv4 -> redsocks -> WARP
+    if [ "$BLOCK_IPV6" = 1 ] && has_v6 && has_v4_default; then
+        targets6=$(collect_extra_v6)
+        if [ -n "$targets6" ]; then
+            { echo "*filter"; echo ":$CHAIN_X6 - [0:0]"
+              echo "-A $CHAIN_X6 -m mark --mark $DIRECT_MARK -j RETURN"
+              for t6 in $targets6; do
+                  echo "-A $CHAIN_X6 -d $t6 -p tcp -j REJECT --reject-with tcp-reset"
+                  echo "-A $CHAIN_X6 -d $t6 -p udp -j REJECT --reject-with icmp6-port-unreachable"
+              done
+              echo "COMMIT"; } > "$fx6"
+            if restore ip6tables-restore "$fx6"; then
+                ip6tables -w -C OUTPUT -j "$CHAIN_X6" 2>/dev/null || ip6tables -w -I OUTPUT 1 -j "$CHAIN_X6"
+            fi
+        else
+            drop_chain ip6tables filter "$CHAIN_X6"
+        fi
+    fi
+
+    rm -f "$f4" "$ff" "$fx6"
     mkdir -p "$STATE_DIR"; date +%s > "$STATE_DIR/refresh"
     return 0
 }
 
 rules_off_extra() {
-    drop_chain iptables  nat    "$CHAIN"   -p tcp
+    drop_chain iptables  nat    "$CHAIN"    -p tcp
     drop_chain iptables  nat    "$CHAIN"
-    drop_chain iptables  filter "$CHAIN_F" -p udp --dport 443
+    drop_chain iptables  filter "$CHAIN_F"  -p udp --dport 443
+    drop_chain ip6tables filter "$CHAIN_X6"
     drop_chain ip6tables filter "$CHAIN_6"
-    rm -f "$STATE_DIR/refresh"
+    rm -f "$STATE_DIR/refresh" "$STATE_DIR/extra-ips.cache" "$STATE_DIR/extra-ips.sig"
     return 0
 }
 
-# 挂载/刷新 Gemini 三域名精准 SNI 分流规则 (仅在状态 == WARP 时调用)
 gemini_rules_on() {
     command -v iptables-restore >/dev/null 2>&1 || return 1
     local f4 ff f6 targets eps n t t6 targets6
@@ -1484,7 +1486,7 @@ gemini_rules_on() {
 
     { echo "*nat"; echo ":$CHAIN_G - [0:0]"
       echo "-A $CHAIN_G -m mark --mark $DIRECT_MARK -j RETURN"
-      for n in $EXCLUDES $eps; do echo "-A $CHAIN_G -d $n -j RETURN"; done
+      for n in $EXCLUDES_GEMINI $eps; do echo "-A $CHAIN_G -d $n -j RETURN"; done
       for t in $targets; do
           echo "-A $CHAIN_G -p tcp --dport 443 -d $t -j REDIRECT --to-ports $SNI_PORT"
           echo "-A $CHAIN_G -p tcp --dport 80 -d $t -j REDIRECT --to-ports $SNI_PORT"
@@ -1493,7 +1495,7 @@ gemini_rules_on() {
 
     { echo "*filter"; echo ":$CHAIN_GF - [0:0]"
       echo "-A $CHAIN_GF -m mark --mark $DIRECT_MARK -j RETURN"
-      for n in $EXCLUDES $eps; do echo "-A $CHAIN_GF -d $n -j RETURN"; done
+      for n in $EXCLUDES_GEMINI $eps; do echo "-A $CHAIN_GF -d $n -j RETURN"; done
       for t in $targets; do echo "-A $CHAIN_GF -p udp --dport 443 -d $t -j REJECT --reject-with icmp-port-unreachable"; done
       echo "COMMIT"; } > "$ff"
 
@@ -1537,7 +1539,6 @@ rules_off() {
     rules_off_extra
 }
 
-# ---------------------------------------------------------------- 启动与守护
 cmd_boot() {
     systemctl start warp-svc >/dev/null 2>&1
     if wait_daemon 60; then
@@ -1566,9 +1567,8 @@ cmd_check() {
             rules_on && log "WARP 恢复，extra.list 分流规则已重新启用"
         else
             last=$(cat "$STATE_DIR/refresh" 2>/dev/null || echo 0); now=$(date +%s)
-            [ $((now - last)) -ge 1800 ] && rules_on
+            [ $((now - last)) -ge 300 ] && rules_on
         fi
-        # 若当前处于 Gemini WARP 模式，每分钟刷新一次三域名最新解析 IP，应对 DNS TTL 轮换
         if gemini_rules_present; then
             gemini_rules_on >/dev/null 2>&1 || true
         fi
@@ -1624,9 +1624,9 @@ cmd_test() {
     local code hits_extra hits_gemini
     say "${CYAN}── 连通性及精准分流测试 ──${NC}"
     code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' https://www.google.com/generate_204)
-    [ "$code" = 204 ] && say "${GREEN}✓ www.google.com (generate_204): $code (应保持非 WARP 原有出口)${NC}" || say "${RED}✗ www.google.com: ${code:-无响应}${NC}"
+    [ "$code" = 204 ] && say "${GREEN}✓ www.google.com (generate_204): $code (保持非 WARP 原有出口)${NC}" || say "${RED}✗ www.google.com: ${code:-无响应}${NC}"
     code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' https://accounts.google.com/)
-    say "  accounts.google.com 状态码: ${code:-无响应} (应保持非 WARP 原有出口)"
+    say "  accounts.google.com 状态码: ${code:-无响应} (保持非 WARP 原有出口)"
     code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' https://gemini.google.com/)
     say "  gemini.google.com 状态码: ${code:-无响应}"
     code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' https://aistudio.google.com/)
@@ -1634,11 +1634,14 @@ cmd_test() {
     code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' https://generativelanguage.googleapis.com/v1beta/models)
     say "  generativelanguage.googleapis.com 状态码: ${code:-无响应}"
     proxy_ok && say "${GREEN}✓ 全局 WARP 代理: warp=on${NC}" || say "${RED}✗ 全局 WARP 代理不可用${NC}"
+    redsocks_ok && say "${GREEN}✓ redsocks 服务: 运行中 (127.0.0.1:${REDIR_PORT})${NC}" || say "${RED}✗ redsocks 未运行${NC}"
     if rules_present; then
+        # 对 extra.list 中第一个可连通目标做一次轻量请求以核验计数器
+        curl -s -m 8 -o /dev/null https://www.reddit.com/ >/dev/null 2>&1 || true
         hits_extra=$(iptables -w -t nat -L "$CHAIN" -nv 2>/dev/null | awk '/REDIRECT/ && $1+0>0 {c++} END{print c+0}')
-        say "  extra.list nat 规则(WARP_GOOGLE): 已启用, 已命中规则数: $hits_extra"
+        say "  extra.list nat 规则(WARP_GOOGLE): ${GREEN}已挂载${NC} (共 $(iptables -w -t nat -S "$CHAIN" 2>/dev/null | grep -c REDIRECT) 条, 已命中规则数: $hits_extra)"
     else
-        say "${YELLOW}  extra.list nat 规则(WARP_GOOGLE): 未启用${NC}"
+        say "${RED}  extra.list nat 规则(WARP_GOOGLE): 未启用${NC}"
     fi
     if gemini_rules_present; then
         hits_gemini=$(iptables -w -t nat -L "$CHAIN_G" -nv 2>/dev/null | awk '/REDIRECT/ && $1+0>0 {c++} END{print c+0}')
@@ -1664,9 +1667,9 @@ cmd_status() {
     proxy_ok && say "  ${GREEN}正常 (warp=on)${NC}" || say "  ${RED}不可用${NC}"
     say "${YELLOW}【非 Google 分流规则 (extra.list -> WARP_GOOGLE)】${NC}"
     if rules_present; then
-        say "  ${GREEN}已启用${NC}: $(iptables -w -t nat -S "$CHAIN" 2>/dev/null | grep -c REDIRECT) 条重定向规则"
+        say "  ${GREEN}已启用${NC}: $(iptables -w -t nat -S "$CHAIN" 2>/dev/null | grep -c REDIRECT) 条 IPv4 重定向规则 (IPv6回落链: $(ip6tables -w -C OUTPUT -j "$CHAIN_X6" 2>/dev/null && echo '已启用' || echo '未启用/无AAAA'))"
     else
-        say "  ${YELLOW}未启用${NC}"
+        say "  ${RED}未启用${NC}"
     fi
     say "${YELLOW}【Gemini 精准动态分流 (WARP_GEMINI -> SNI 精确匹配)】${NC}"
     if gemini_rules_present; then
@@ -1679,7 +1682,7 @@ cmd_status() {
 }
 
 cmd_update() {
-    say "${YELLOW}! v2.1 中 Gemini 采用三域名 SNI 精准动态匹配，google.list/google6.list 不再用于路由，仅保留为参考文件。${NC}"
+    say "${YELLOW}! v2.2 中 Gemini 采用三域名 SNI 精准动态匹配，google.list/google6.list 不再用于路由，仅保留为参考文件。${NC}"
     return 0
 }
 
@@ -1758,7 +1761,7 @@ cmd_uninstall() {
 
 usage() {
     cat << EOF
-WARP 管理工具 v2.1
+WARP 管理工具 v2.2
 
 用法: warp <命令>
 
@@ -1766,7 +1769,7 @@ WARP 管理工具 v2.1
   start          启动全部服务与 Gemini 随机检测守护
   stop           停止全部服务并移除规则
   restart        重启服务 (修改 extra.list / endpoints.list 后执行)
-  test           测试非 Google/非 WARP 域名与 Gemini 三域名连通性
+  test           测试非 Google/非 WARP 域名、extra.list 与 Gemini 连通性
   ip             对比直连 IP 与 WARP IP
   gemini-status  查看 Gemini 状态机 JSON 详情
   gemini-check   立即执行一轮带锁的 Gemini 健康检测
@@ -1808,9 +1811,6 @@ ENGINE_EOF
     chmod 755 "$ENGINE"
 }
 
-# ----------------------------------------------------------------------------
-# 配置文件、Endpoint 候选表与日志轮转
-# ----------------------------------------------------------------------------
 write_config() {
     mkdir -p "$CONF_DIR" "$LOG_DIR"
     cat > "$CONF_DIR/warp-google.conf" << EOF
@@ -1847,7 +1847,6 @@ EOF
 
     [ -f "$CONF_DIR/endpoints.list" ] || cat > "$CONF_DIR/endpoints.list" << 'EOF'
 # Cloudflare WARP 候选 Endpoint 列表（每行一个 IP:Port 或 default）
-# 当 WARP 出口也受到 Gemini 地区限制时按顺序尝试轮换，全部失败自动回滚。
 162.159.192.1:2408
 162.159.193.10:2408
 162.159.195.1:500
@@ -1858,9 +1857,8 @@ EOF
 default
 EOF
 
-    # 完整保留原有 extra.list（若已存在则不覆盖用户自定义规则）
     [ -f "$CONF_DIR/extra.list" ] || cat > "$CONF_DIR/extra.list" << 'EOF'
-# 其它需要走 WARP 的站点: 每行一个 域名 或 IPv4/CIDR。域名会在启动时解析并每 30 分钟刷新。
+# 其它需要走 WARP 的站点: 每行一个 域名 或 IPv4/CIDR。域名会在启动时解析并每 5 分钟刷新。
 # 不需要的整行删掉或在行首加 # ；修改后执行 `warp restart` 生效。
 
 # --- PornHub 系 ---
@@ -1927,9 +1925,6 @@ EOF
 EOF
 }
 
-# ----------------------------------------------------------------------------
-# 安装与环境准备
-# ----------------------------------------------------------------------------
 preflight() {
     [ -n "$(ip -4 route show default 2>/dev/null)" ] || die "本机没有 IPv4 默认路由，纯 IPv6 VPS 不适用本脚本"
     ensure_tools
@@ -1947,7 +1942,6 @@ ensure_tools() {
         pkg_install "${need[@]}" >/dev/null 2>&1 || die "依赖安装失败: ${need[*]}"
     fi
     iptables -w -t nat -L -n >/dev/null 2>&1 || die "iptables nat 表不可用，无法使用透明代理"
-    # 检测 xt_mark 支持（用于 SO_MARK 旁路防止精准 SNI 回环）
     iptables -w -t nat -N WARP_MARK_TEST 2>/dev/null || true
     if ! iptables -w -t nat -A WARP_MARK_TEST -m mark --mark "$DIRECT_MARK" -j RETURN >/dev/null 2>&1; then
         iptables -w -t nat -X WARP_MARK_TEST 2>/dev/null || true
@@ -2147,8 +2141,11 @@ setup_proxy_rules() {
     sleep 1
     systemctl is-active --quiet warp-redsocks || { journalctl -u warp-redsocks -n 15 --no-pager; die "redsocks 启动失败"; }
     systemctl restart warp-google
+    if ! iptables -w -t nat -C OUTPUT -p tcp -j WARP_GOOGLE 2>/dev/null; then
+        warn "首次启动未自动挂载 WARP_GOOGLE，尝试显式应用并输出日志..."
+        "$ENGINE" rules-on || { journalctl -u warp-google -n 20 --no-pager; die "extra.list 规则挂载失败"; }
+    fi
     systemctl start warp-google-watchdog.timer
-    # 首次启动默认 DIRECT 并立即进行首轮 Gemini 健康检测
     systemctl restart warp-gemini
 
     if [ -e "$SHORTCUT" ] && ! grep -q 'WARP-GOOGLE-ENGINE' "$SHORTCUT" 2>/dev/null && [ ! -L "$SHORTCUT" ]; then
@@ -2177,7 +2174,7 @@ do_install() {
     echo
     "$ENGINE" test
     echo
-    ok "安装/更新完成！默认状态为 DIRECT（三域名直连），非 Google 系 extra.list 保留走 WARP。"
+    ok "安装/更新完成！extra.list 走 WARP 已校验，Gemini 默认为 DIRECT 直连。"
     echo -e "日志查看: ${CYAN}warp gemini-logs${NC}  |  状态查看: ${CYAN}warp status${NC}  |  回滚: ${CYAN}warp rollback${NC}"
 }
 
@@ -2203,7 +2200,7 @@ show_menu() {
     local choice
     while true; do
         echo -e "${YELLOW}请选择操作:${NC}\n"
-        echo -e "  ${GREEN}1.${NC} 安装 / 增量升级 WARP (Gemini 直连优先 + 精准动态分流)"
+        echo -e "  ${GREEN}1.${NC} 安装 / 增量升级 WARP (修复 extra.list + Gemini 精准动态分流)"
         echo -e "  ${GREEN}2.${NC} 卸载 WARP"
         echo -e "  ${GREEN}3.${NC} 查看状态 / 测试"
         echo -e "  ${GREEN}4.${NC} 重启服务"
