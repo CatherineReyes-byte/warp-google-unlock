@@ -2000,6 +2000,8 @@ hostloc.com
 www.hostloc.com
 gamer.com.tw
 www.gamer.com.tw
+virustotal.com
+www.virustotal.com
 54.172.97.0/22
 23.255.155.0/24
 # 52.5.0.0/16
